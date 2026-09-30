@@ -1,3 +1,5 @@
+from xml.parsers.expat import model
+
 from pyomo.environ import *
 from pyomo.opt import SolverFactory
 
@@ -377,6 +379,112 @@ class SolverGeneralModel(Solver):
         self.model.demand = Constraint(self.model.H, self.model.T, rule=self.demand)
         self.model.electrans = Constraint(self.model.H, self.model.T, rule=self.elec_correspondance)
 
+        
+        # Solve model
+        SolverFactory(self.solver_name).solve(self.model)
+
+        # Return cost
+        return sum(self.community_cost(self.model, t) for t in range(N))
+
+"""
+ST 30.09.26
+Static Sharing Solver (Aufteilungsschlüssel): introduction of allocation keys that defines sharing volume..
+"""
+class SolverStaticSharing(SolverGeneralModel):
+    def __init__(self, allocation_keys, prosumer, residual_price=0.0, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if abs(sum(allocation_keys.values()) - 1.0) > 1e-9:
+            raise ValueError("Allocation keys must sum to 1.")
+
+        if prosumer in allocation_keys:
+            raise ValueError(
+                "Prosumer must not be included in allocation_keys."
+            )
+
+        if any(alpha < 0 for alpha in allocation_keys.values()):
+            raise ValueError(
+                "Allocation keys must be non-negative."
+            )
+
+        self.allocation_keys = allocation_keys
+        self.prosumer = prosumer
+        self.residual_price = residual_price
+
+    def sharing_allocation_limit(self, model, c, t):  # E_sharing <= alpha * E_PVüberschuss
+
+        if c not in self.allocation_keys:
+            return Constraint.Skip
+
+        alpha = self.allocation_keys[c]
+
+    def pv_available(self, t):
+        pv_generation = (
+            self.sunf(self.prosumer, t)
+            * self.pv[self.prosumer]
+        )
+
+        return max(
+            pv_generation - self.consf(self.prosumer, t),
+            0
+        )
+
+    def sharing_demand_limit(self, model, c, t):  # E_sharing <= E_cons
+        if c not in self.allocation_keys:
+            return Constraint.Skip
+
+        return model.imported[c, t] <= self.consf(c, t)
+
+    def only_prosumer_exports(self, model, h, t):  # nur der Prosumer darf Community-Energie exportieren.
+
+        if h == self.prosumer:
+            return Constraint.Skip
+
+        return model.exported[h, t] == 0
+
+    def prosumer_no_import(self, model, t):  # Consumer sollen nur importieren und nicht exportieren.
+        return model.imported[self.prosumer, t] == 0
+
+    def only_allocated_consumers_import(self, model, h, t):  # Haushalte, die keine allocation_key zugeteilt bekommen haben (weil sie kein ES machen wollen), können keine Sharing-Energie importieren. 
+
+        if h in self.allocation_keys:
+            return Constraint.Skip
+
+        return model.imported[h, t] == 0
+
+    def solve(self, N):
+        # Init
+        bat0 = [0]*len(self.maxbat)
+        i, j = 0, N-1
+        self._init_predictors(i,j)
+
+        # Build model
+        self.model = ConcreteModel()
+        self.model.T = RangeSet(i,j)
+        self.model.H = RangeSet(0,len(self.pv)-1)
+
+        ### variables: battery level, dis/charge, el bought, sold, locally imported and exported.
+        self.model.bat = Var(self.model.H, self.model.T, domain=NonNegativeReals)
+        self.model.charge = Var(self.model.H, self.model.T, domain=NonNegativeReals)
+        self.model.discharge = Var(self.model.H, self.model.T, domain=NonNegativeReals)
+        
+        self.model.el_in = Var(self.model.H, self.model.T, domain=NonNegativeReals)
+        self.model.el_out = Var(self.model.H, self.model.T, domain=NonNegativeReals)
+        self.model.imported = Var(self.model.H, self.model.T, domain=NonNegativeReals)
+        self.model.exported = Var(self.model.H, self.model.T, domain=NonNegativeReals)
+    
+        self.model.OBJ = Objective(expr = sum(self._cost_model(h, t)
+                                            for h in self.model.H for t in self.model.T))
+            
+        self.model.batlimit = Constraint(self.model.H, self.model.T, rule=self.battery_limit)
+        self.model.batlevel = Constraint(self.model.H, self.model.T, rule=self.battery_level(bat0, i))
+        self.model.demand = Constraint(self.model.H, self.model.T, rule=self.demand)
+        self.model.electrans = Constraint(self.model.H, self.model.T, rule=self.elec_correspondance)
+        self.model.sharingAllocation = Constraint(self.model.H, self.model.T, rule=self.sharing_allocation_limit)
+        self.model.sharingDemand = Constraint(self.model.H, self.model.T, rule=self.sharing_demand_limit)
+        self.model.onlyProsumerExports = Constraint(self.model.H, self.model.T, rule=self.only_prosumer_exports)
+        self.model.prosumerNoImport = Constraint(self.model.T, rule=self.prosumer_no_import)
+        self.model.onlyAllocatedConsumersImport = Constraint(self.model.H, self.model.T, rule=self.only_allocated_consumers_import)
         
         # Solve model
         SolverFactory(self.solver_name).solve(self.model)

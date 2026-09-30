@@ -506,6 +506,33 @@ class Optimizer():
         opt.price = list(opt.price)
         return opt
 
+    def static_sharing_solver(self, allocation_keys, prosumer,
+                          residual_price=0.0):
+
+        self.solver = SolverStaticSharing(
+            allocation_keys,
+            prosumer,
+            residual_price,
+            0,                  # charge_loss
+            0,                  # discharge_loss
+            1,                  # selfdischarge
+            0,                  # syst_losses
+            0,                  # trans_losses
+            0,                  # grid_fee
+            self.pv,
+            self.battery,
+            self.cons,
+            self.sun,
+            self.price,
+            self.predictor,
+            self.tax,
+            self.el_tax,
+            self.el_net,
+            self.snm
+        )
+
+        return self.solver
+
 
 ## this one requires a huge clean-up!
 class OptimizerExt(Optimizer):

@@ -70,7 +70,23 @@ class Optimizer():
         else:
             self.sun = loadcsv(sun_file)
 
+        self.sun = np.array(self.sun)
+
+        # If only one solar profile is given, use it for all households
+        if self.sun.ndim == 1:
+            self.sun = np.tile(
+                self.sun,
+                (len(self.cons), 1)
+            )
+
         self.price = np.array(load(price_file))
+
+        # Alle vier Haushalte bekommen dasselbe Haushaltsstrompreisprofil.
+        if self.price.ndim == 1:
+            self.price = np.tile(
+                self.price,
+                (len(self.cons), 1)
+            )
 
         # [extension] this should also be loaded. params.csv
         self.tax = tax
@@ -506,13 +522,14 @@ class Optimizer():
         opt.price = list(opt.price)
         return opt
 
-    def static_sharing_solver(self, allocation_keys, prosumer,
-                          residual_price=0.0):
+    def static_sharing_solver(self, allocation_keys, prosumer, p_p2p, p_feed_in=0.08, residual_price=0.0):
 
         self.solver = SolverStaticSharing(
             allocation_keys,
             prosumer,
+            p_p2p,
             residual_price,
+            p_feed_in,
             0,                  # charge_loss
             0,                  # discharge_loss
             1,                  # selfdischarge

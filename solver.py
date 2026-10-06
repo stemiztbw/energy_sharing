@@ -379,19 +379,19 @@ class SolverGeneralModel(Solver):
         self.model.demand = Constraint(self.model.H, self.model.T, rule=self.demand)
         self.model.electrans = Constraint(self.model.H, self.model.T, rule=self.elec_correspondance)
 
-        
         # Solve model
         SolverFactory(self.solver_name).solve(self.model)
 
         # Return cost
         return sum(self.community_cost(self.model, t) for t in range(N))
 
+
 """
 ST 30.09.26
 Static Sharing Solver (Aufteilungsschlüssel): introduction of allocation keys that defines sharing volume..
 """
 class SolverStaticSharing(SolverGeneralModel):
-    def __init__(self, allocation_keys, prosumer, residual_price=0.0, *args, **kwargs):
+    def __init__(self, allocation_keys, prosumer, p_p2p, residual_price=0.0, p_feed_in=0.08, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         if abs(sum(allocation_keys.values()) - 1.0) > 1e-9:
@@ -407,10 +407,20 @@ class SolverStaticSharing(SolverGeneralModel):
                 "Allocation keys must be non-negative."
             )
 
+        # --- Static Sharing Parameters ---
         self.allocation_keys = allocation_keys
         self.prosumer = prosumer
         self.residual_price = residual_price
 
+        # --- Price Parameters ---
+        self.p_p2p = p_p2p
+        self.p_feed_in = p_feed_in
+
+    # ---------------------------------------------------------
+    # STATIC ALLOCATION
+    # ---------------------------------------------------------
+
+    """
     def sharing_allocation_limit(self, model, c, t):  # E_sharing <= alpha * E_PVüberschuss
 
         if c not in self.allocation_keys:
@@ -418,6 +428,12 @@ class SolverStaticSharing(SolverGeneralModel):
 
         alpha = self.allocation_keys[c]
 
+        # Full generation is the basis for the allocation key
+        generation = self.sunf(self.prosumer, t) * self.pv[self.prosumer]
+
+        return (model.imported[c, t] <= alpha * generation)
+
+    
     def pv_available(self, t):
         pv_generation = (
             self.sunf(self.prosumer, t)
@@ -428,13 +444,37 @@ class SolverStaticSharing(SolverGeneralModel):
             pv_generation - self.consf(self.prosumer, t),
             0
         )
+    
 
+    # Consumer cannot use more sharing energy than its demand
     def sharing_demand_limit(self, model, c, t):  # E_sharing <= E_cons
         if c not in self.allocation_keys:
             return Constraint.Skip
 
         return model.imported[c, t] <= self.consf(c, t)
+    """
 
+    def static_sharing(self, model, c, t):
+
+        if c not in self.allocation_keys:
+            return Constraint.Skip
+
+        alpha = self.allocation_keys[c]
+
+        # Full generation is the basis for the allocation key
+        generation = (
+            self.sunf(self.prosumer, t)
+            * self.pv[self.prosumer]
+        )
+
+        allocation = alpha * generation
+        demand = self.consf(c, t)
+
+        sharing = min(allocation, demand)
+
+        return model.imported[c, t] == sharing
+
+    # Only the prosumer can export community energy
     def only_prosumer_exports(self, model, h, t):  # nur der Prosumer darf Community-Energie exportieren.
 
         if h == self.prosumer:
@@ -442,15 +482,88 @@ class SolverStaticSharing(SolverGeneralModel):
 
         return model.exported[h, t] == 0
 
+    """
     def prosumer_no_import(self, model, t):  # Consumer sollen nur importieren und nicht exportieren.
         return model.imported[self.prosumer, t] == 0
-
+    """
+ 
     def only_allocated_consumers_import(self, model, h, t):  # Haushalte, die keine allocation_key zugeteilt bekommen haben (weil sie kein ES machen wollen), können keine Sharing-Energie importieren. 
 
         if h in self.allocation_keys:
             return Constraint.Skip
 
         return model.imported[h, t] == 0
+
+    # ---------------------------------------------------------
+    # COMMUITY SURPLUS
+    # ---------------------------------------------------------
+
+    def community_surplus(self):
+
+        surplus_data = []
+
+        for t in self.model.T:
+
+            generation = (
+                self.sunf(self.prosumer, t)
+                * self.pv[self.prosumer]
+            )
+
+            for c, alpha in self.allocation_keys.items():
+
+                allocated = alpha * generation
+                shared = self.model.imported[c, t].value
+                surplus = max(allocated - shared, 0.0)
+
+                surplus_data.append({
+                    "t": t,
+                    "consumer": c,
+                    "allocated": allocated,
+                    "shared": shared,
+                    "surplus": surplus
+                })
+
+        return surplus_data
+    
+    def print_community_surplus(self):
+
+        total_surplus = 0.0
+
+        for t in self.model.T:
+
+            generation = (
+                self.sunf(self.prosumer, t)
+                * self.pv[self.prosumer]
+            )
+
+            for c, alpha in self.allocation_keys.items():
+            
+                allocated = alpha * generation
+
+                shared = self.model.imported[c, t].value
+
+                surplus = max(allocated - shared, 0.0)
+
+                if surplus > 1e-6:
+                    print(
+                        f"t={t}: Consumer {c} -> "
+                        f"{surplus:.3f} kWh Community-Überschuss "
+                        f"(zugeteilt: {allocated:.3f} kWh, "
+                        f"verbraucht: {shared:.3f} kWh)"
+                    )
+
+                total_surplus += surplus
+
+        print(
+            f"\nGesamter Community-Überschuss: "
+            f"{total_surplus:.3f} kWh"
+        )
+
+        return total_surplus
+
+    # ---------------------------------------------------------
+    # SOLVE
+    # ---------------------------------------------------------
 
     def solve(self, N):
         # Init
@@ -480,17 +593,34 @@ class SolverStaticSharing(SolverGeneralModel):
         self.model.batlevel = Constraint(self.model.H, self.model.T, rule=self.battery_level(bat0, i))
         self.model.demand = Constraint(self.model.H, self.model.T, rule=self.demand)
         self.model.electrans = Constraint(self.model.H, self.model.T, rule=self.elec_correspondance)
-        self.model.sharingAllocation = Constraint(self.model.H, self.model.T, rule=self.sharing_allocation_limit)
-        self.model.sharingDemand = Constraint(self.model.H, self.model.T, rule=self.sharing_demand_limit)
+        #self.model.sharingAllocation = Constraint(self.model.H, self.model.T, rule=self.sharing_allocation_limit)
+        #self.model.sharingDemand = Constraint(self.model.H, self.model.T, rule=self.sharing_demand_limit)
+        self.model.staticSharing = Constraint(self.model.H, self.model.T, rule=self.static_sharing)
         self.model.onlyProsumerExports = Constraint(self.model.H, self.model.T, rule=self.only_prosumer_exports)
-        self.model.prosumerNoImport = Constraint(self.model.T, rule=self.prosumer_no_import)
+        #self.model.prosumerNoImport = Constraint(self.model.T, rule=self.prosumer_no_import)
         self.model.onlyAllocatedConsumersImport = Constraint(self.model.H, self.model.T, rule=self.only_allocated_consumers_import)
         
         # Solve model
         SolverFactory(self.solver_name).solve(self.model)
 
         # Return cost
-        return sum(self.community_cost(self.model, t) for t in range(N))
+        #return sum(self.community_cost(self.model, t) for t in range(N))
+
+        for h in self.model.H:
+            for t in self.model.T:
+                if self.model.el_in[h, t].value is None:
+                    print("None: el_in", h, t)
+
+                if self.model.el_out[h, t].value is None:
+                    print("None: el_out", h, t)
+
+                if self.model.imported[h, t].value is None:
+                    print("None: imported", h, t)
+
+                if self.model.exported[h, t].value is None:
+                    print("None: exported", h, t)
+
+        return 0
 
 
 """
